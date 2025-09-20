@@ -31,6 +31,9 @@ type Middleware struct {
 	// LookupHandler is used to look up current subject in runtime.
 	// If it can not find anything, just return an empty string.
 	lookup LookupHandler
+	// DomainLookupHandler is used for multi-tenant scenarios to look up both subject and domain.
+	// If EnableDomains is true, this handler will be used instead of lookup.
+	domainLookup DomainLookupHandler
 }
 
 // NewCasbinMiddleware returns a new Middleware using Casbin's Enforcer internally.
@@ -59,6 +62,24 @@ func NewCasbinMiddlewareFromEnforcer(e casbin.IEnforcer, lookup LookupHandler) (
 	}, nil
 }
 
+// NewCasbinMiddlewareFromEnforcerWithDomain creates from given Enforcer with domain support.
+func NewCasbinMiddlewareFromEnforcerWithDomain(e casbin.IEnforcer, domainLookup DomainLookupHandler) (*Middleware, error) {
+	if domainLookup == nil {
+		return nil, errDomainLookupNil
+	}
+
+	return &Middleware{
+		enforcer:     e,
+		domainLookup: domainLookup,
+	}, nil
+}
+
+// Enforcer returns the underlying Casbin enforcer instance.
+// This method provides access to the enforcer for advanced operations.
+func (m *Middleware) Enforcer() casbin.IEnforcer {
+	return m.enforcer
+}
+
 // RequiresPermissions tries to find the current subject and determine if the
 // subject has the required permissions according to predefined Casbin policies.
 func (m *Middleware) RequiresPermissions(expression string, opts ...Option) app.HandlerFunc {
@@ -69,29 +90,63 @@ func (m *Middleware) RequiresPermissions(expression string, opts ...Option) app.
 			c.Next(ctx)
 			return
 		}
-		// Look up current subject.
-		sub := m.lookup(ctx, c)
-		if sub == "" {
-			options.Unauthorized(ctx, c)
-			return
+
+		var sub, domain string
+		if options.EnableDomains {
+			if m.domainLookup == nil {
+				// EnableDomains is true but no domain lookup handler provided
+				c.AbortWithStatus(consts.StatusInternalServerError)
+				return
+			}
+			// Use domain lookup for multi-tenant scenarios
+			sub, domain = m.domainLookup(ctx, c)
+			if sub == "" {
+				options.Unauthorized(ctx, c)
+				return
+			}
+		} else {
+			if m.lookup == nil {
+				// No lookup handler provided for single-tenant mode
+				c.AbortWithStatus(consts.StatusInternalServerError)
+				return
+			}
+			// Look up current subject.
+			sub = m.lookup(ctx, c)
+			if sub == "" {
+				options.Unauthorized(ctx, c)
+				return
+			}
 		}
+
 		// Enforce Casbin policies.
 		if options.Logic == AND {
 			// Must pass all tests.
 			permissions := strings.Split(expression, " ")
 			for _, permission := range permissions {
 				vals := append([]string{sub}, options.PermissionParser(permission)...)
-				if vals[0] == "" || vals[1] == "" {
+				if len(vals) < 3 || vals[0] == "" || vals[1] == "" || vals[2] == "" {
 					// Can not handle any illegal permission strings.
 					c.AbortWithStatus(consts.StatusInternalServerError)
 					return
 				}
-				if ok, err := m.enforcer.Enforce(stringSliceToInterfaceSlice(vals)...); err != nil {
+
+				// 构造执行参数
+				enforceArgs := m.buildEnforceArgs(sub, domain, vals[1], vals[2], options.EnableDomains)
+
+				if ok, err := m.enforcer.Enforce(enforceArgs...); err != nil {
+					if options.EnableAuditLog {
+						LogAuthorizationDecision(sub, domain, vals[1], vals[2], false, err)
+					}
 					c.AbortWithStatus(consts.StatusInternalServerError)
 					return
 				} else if !ok {
+					if options.EnableAuditLog {
+						LogAuthorizationDecision(sub, domain, vals[1], vals[2], false, nil)
+					}
 					options.Forbidden(ctx, c)
 					return
+				} else if options.EnableAuditLog {
+					LogAuthorizationDecision(sub, domain, vals[1], vals[2], true, nil)
 				}
 			}
 			c.Next(ctx)
@@ -101,12 +156,16 @@ func (m *Middleware) RequiresPermissions(expression string, opts ...Option) app.
 			permissions := strings.Split(expression, " ")
 			for _, permission := range permissions {
 				values := append([]string{sub}, options.PermissionParser(permission)...)
-				if values[0] == "" || values[1] == "" {
+				if len(values) < 3 || values[0] == "" || values[1] == "" {
 					// Can not handle any illegal permission strings.
 					c.AbortWithStatus(consts.StatusInternalServerError)
 					return
 				}
-				if ok, err := m.enforcer.Enforce(stringSliceToInterfaceSlice(values)...); err != nil {
+
+				// 构造执行参数
+				enforceArgs := m.buildEnforceArgs(sub, domain, values[1], values[2], options.EnableDomains)
+
+				if ok, err := m.enforcer.Enforce(enforceArgs...); err != nil {
 					c.AbortWithStatus(consts.StatusInternalServerError)
 					return
 				} else if ok {
@@ -129,12 +188,16 @@ func (m *Middleware) RequiresPermissions(expression string, opts ...Option) app.
 
 			for _, permission := range permissions {
 				vals := append([]string{sub}, options.PermissionParser(permission)...)
-				if vals[0] == "" || vals[1] == "" {
+				if len(vals) < 3 || vals[0] == "" || vals[1] == "" || vals[2] == "" {
 					// Can not handle any illegal permission strings.
 					c.AbortWithStatus(consts.StatusInternalServerError)
 					return
 				}
-				if ok, err := m.enforcer.Enforce(stringSliceToInterfaceSlice(vals)...); err != nil {
+
+				// 构造执行参数
+				enforceArgs := m.buildEnforceArgs(sub, domain, vals[1], vals[2], options.EnableDomains)
+
+				if ok, err := m.enforcer.Enforce(enforceArgs...); err != nil {
 					c.AbortWithStatus(consts.StatusInternalServerError)
 					return
 				} else {
@@ -179,16 +242,50 @@ func (m *Middleware) RequiresRoles(expression string, opts ...Option) app.Handle
 			c.Next(ctx)
 			return
 		}
-		// Look up current subject.
-		sub := m.lookup(ctx, c)
-		if sub == "" {
-			options.Unauthorized(ctx, c)
-			return
+
+		var sub, domain string
+		if options.EnableDomains {
+			if m.domainLookup == nil {
+				// EnableDomains is true but no domain lookup handler provided
+				c.AbortWithStatus(consts.StatusInternalServerError)
+				return
+			}
+			// Use domain lookup for multi-tenant scenarios
+			sub, domain = m.domainLookup(ctx, c)
+			if sub == "" {
+				options.Unauthorized(ctx, c)
+				return
+			}
+		} else {
+			if m.lookup == nil {
+				// No lookup handler provided for single-tenant mode
+				c.AbortWithStatus(consts.StatusInternalServerError)
+				return
+			}
+			// Look up current subject.
+			sub = m.lookup(ctx, c)
+			if sub == "" {
+				options.Unauthorized(ctx, c)
+				return
+			}
 		}
-		actualRoles, err := m.enforcer.GetRolesForUser(sub)
-		if err != nil {
-			c.AbortWithStatus(consts.StatusInternalServerError)
-			return
+
+		var actualRoles []string
+		var err error
+		if options.EnableDomains {
+			// Get roles for user in specific domain
+			actualRoles = m.enforcer.GetRolesForUserInDomain(sub, domain)
+			if actualRoles == nil {
+				c.AbortWithStatus(consts.StatusInternalServerError)
+				return
+			}
+		} else {
+			// Get roles for user without domain
+			actualRoles, err = m.enforcer.GetRolesForUser(sub)
+			if err != nil {
+				c.AbortWithStatus(consts.StatusInternalServerError)
+				return
+			}
 		}
 
 		if options.Logic == AND {
@@ -254,6 +351,17 @@ func (m *Middleware) RequiresRoles(expression string, opts ...Option) app.Handle
 	}
 }
 
+// buildEnforceArgs 构造 Casbin enforcer 的参数数组
+// 支持域模式和简单模式两种场景
+func (m *Middleware) buildEnforceArgs(sub, domain, obj, act string, enableDomains bool) []interface{} {
+	if enableDomains {
+		// 域模式：sub, domain, obj, act
+		return []interface{}{sub, domain, obj, act}
+	}
+	// 简单模式：sub, obj, act
+	return []interface{}{sub, obj, act}
+}
+
 func containsString(s []string, v string) bool {
 	for _, vv := range s {
 		if vv == v {
@@ -261,12 +369,4 @@ func containsString(s []string, v string) bool {
 		}
 	}
 	return false
-}
-
-func stringSliceToInterfaceSlice(s []string) []interface{} {
-	res := make([]interface{}, len(s))
-	for i, v := range s {
-		res[i] = v
-	}
-	return res
 }

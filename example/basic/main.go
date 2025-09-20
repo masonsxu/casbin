@@ -31,7 +31,7 @@ func main() {
 	// Using sessions and casbin.
 	store := cookie.NewStore([]byte("secret"))
 	h.Use(sessions.New("session", store))
-	auth, err := casbin.NewCasbinMiddleware("example/config/model.conf", "example/config/policy.csv", subjectFromSession)
+	auth, err := casbin.NewCasbinMiddleware("config/model.conf", "config/policy.csv", subjectFromSession)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -17,6 +17,8 @@ package casbin
 import (
 	"context"
 	"errors"
+	"log"
+	"regexp"
 	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -26,6 +28,10 @@ import (
 // LookupHandler is used to look up current subject in runtime.
 // If it can not find anything, just return an empty string.
 type LookupHandler func(ctx context.Context, c *app.RequestContext) string
+
+// DomainLookupHandler is used to look up current subject and domain in runtime.
+// If it can not find anything, just return empty strings.
+type DomainLookupHandler func(ctx context.Context, c *app.RequestContext) (subject, domain string)
 
 // Logic is the logical operation (AND/OR) used in permission checks
 // in case multiple permissions or roles are specified.
@@ -41,7 +47,21 @@ const (
 	CUSTOM
 )
 
-var errLookupNil = errors.New("[Casbin] Lookup is nil")
+const (
+	DefaultPermissionSeparator = ":"
+	MaxDomainNameLength        = 32
+	MaxSubjectNameLength       = 64
+)
+
+var (
+	errLookupNil       = errors.New("[Casbin] Lookup is nil")
+	errDomainLookupNil = errors.New("[Casbin] DomainLookup is nil")
+
+	// Domain validation regex: alphanumeric, underscore, hyphen, 1-32 chars
+	domainNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
+	// Subject validation regex: alphanumeric, underscore, dot, 1-64 chars
+	subjectNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
+)
 
 // Option is the only struct that can be used to set Options.
 type Option struct {
@@ -60,6 +80,14 @@ type Options struct {
 	PermissionParser PermissionParserFunc
 	// PermissionSeparator permission parsing separator
 	PermissionSeparator string
+
+	// EnableDomains enables multi-tenant domain support
+	// Optional. Default: false
+	EnableDomains bool
+
+	// EnableAuditLog enables security audit logging for authorization decisions
+	// Optional. Default: false
+	EnableAuditLog bool
 
 	// Unauthorized defines the response body for unauthorized responses.
 	// Optional. Default: func(ctx context.Context, c *app.RequestContext) {
@@ -81,14 +109,38 @@ func (o *Options) Apply(opts []Option) {
 	}
 }
 
-const (
-	DefaultPermissionSeparator = ":"
-)
+// ValidateDomainName validates if the domain name follows security rules
+func ValidateDomainName(domain string) error {
+	if len(domain) == 0 || len(domain) > MaxDomainNameLength {
+		return errors.New("invalid domain name length")
+	}
+
+	if !domainNameRegex.MatchString(domain) {
+		return errors.New("invalid domain name format")
+	}
+
+	return nil
+}
+
+// ValidateSubjectName validates if the subject name follows security rules
+func ValidateSubjectName(subject string) error {
+	if len(subject) == 0 || len(subject) > MaxSubjectNameLength {
+		return errors.New("invalid subject name length")
+	}
+
+	if !subjectNameRegex.MatchString(subject) {
+		return errors.New("invalid subject name format")
+	}
+
+	return nil
+}
 
 var OptionsDefault = Options{
 	Logic:               AND,
 	PermissionParser:    PermissionParserWithSeparator(DefaultPermissionSeparator),
 	PermissionSeparator: DefaultPermissionSeparator,
+	EnableDomains:       false,
+	EnableAuditLog:      false,
 	Unauthorized: func(ctx context.Context, c *app.RequestContext) {
 		c.AbortWithStatus(consts.StatusUnauthorized)
 	},
@@ -102,6 +154,8 @@ func NewOptions(opts ...Option) *Options {
 		Logic:               OptionsDefault.Logic,
 		PermissionParser:    OptionsDefault.PermissionParser,
 		PermissionSeparator: OptionsDefault.PermissionSeparator,
+		EnableDomains:       OptionsDefault.EnableDomains,
+		EnableAuditLog:      OptionsDefault.EnableAuditLog,
 		Unauthorized:        OptionsDefault.Unauthorized,
 		Forbidden:           OptionsDefault.Forbidden,
 	}
@@ -153,6 +207,39 @@ func WithForbidden(f app.HandlerFunc) Option {
 		F: func(o *Options) {
 			o.Forbidden = f
 		},
+	}
+}
+
+// WithEnableDomains enables multi-tenant domain support.
+func WithEnableDomains(enable bool) Option {
+	return Option{
+		F: func(o *Options) {
+			o.EnableDomains = enable
+		},
+	}
+}
+
+// WithEnableAuditLog enables security audit logging for authorization decisions.
+func WithEnableAuditLog(enable bool) Option {
+	return Option{
+		F: func(o *Options) {
+			o.EnableAuditLog = enable
+		},
+	}
+}
+
+// LogAuthorizationDecision logs authorization decisions for audit purposes
+func LogAuthorizationDecision(sub, domain, obj, act string, allowed bool, err error) {
+	if err != nil {
+		log.Printf("[CASBIN_AUDIT] Authorization error: subject=%s domain=%s object=%s action=%s error=%v",
+			sub, domain, obj, act, err)
+	} else {
+		status := "ALLOWED"
+		if !allowed {
+			status = "DENIED"
+		}
+		log.Printf("[CASBIN_AUDIT] Authorization decision: subject=%s domain=%s object=%s action=%s result=%s",
+			sub, domain, obj, act, status)
 	}
 }
 

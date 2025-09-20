@@ -1,0 +1,20 @@
+p, admin, tenant1, book, read
+p, admin, tenant1, book, write
+p, admin, tenant1, book, delete
+p, user, tenant1, book, read
+p, guest, tenant1, book, read
+
+p, admin, tenant2, article, read
+p, admin, tenant2, article, write
+p, editor, tenant2, article, write
+p, reader, tenant2, article, read
+
+p, super_admin, global, system, manage
+
+g, alice, admin, tenant1
+g, alice, reader, tenant2
+g, bob, user, tenant1
+g, charlie, admin, tenant2
+g, david, editor, tenant2
+g, eve, guest, tenant1
+g, frank, super_admin, global

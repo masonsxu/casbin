@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/casbin/casbin/v2"
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/common/test/assert"
@@ -27,15 +28,27 @@ import (
 )
 
 const (
-	modelFile       = "./example/config/model.conf"
-	simplePolicy    = "./example/config/policy.csv"
-	readWritePolicy = "./example/config/policy_read_write.csv"
-	userAdminPolicy = "./example/config/policy_user_admin.csv"
+	modelFile            = "./example/basic/config/model.conf"
+	modelFileMultiTenant = "./example/multi-tenant/config/model_multi_tenant.conf"
+	simplePolicy         = "./example/basic/config/policy.csv"
+	readWritePolicy      = "./example/basic/config/policy_read_write.csv"
+	userAdminPolicy      = "./example/basic/config/policy_user_admin.csv"
+	multiTenantPolicy    = "./example/multi-tenant/config/policy_multi_tenant.csv"
 )
 
 var (
-	LookupAlice = func(ctx context.Context, c *app.RequestContext) string { return "alice" }
-	LookupNil   = func(ctx context.Context, c *app.RequestContext) string { return "" }
+	LookupAlice   = func(ctx context.Context, c *app.RequestContext) string { return "alice" }
+	LookupBob     = func(ctx context.Context, c *app.RequestContext) string { return "bob" }
+	LookupCharlie = func(ctx context.Context, c *app.RequestContext) string { return "charlie" }
+	LookupNil     = func(ctx context.Context, c *app.RequestContext) string { return "" }
+
+	// Multi-tenant lookup handlers
+	DomainLookupAliceTenant1   = func(ctx context.Context, c *app.RequestContext) (string, string) { return "alice", "tenant1" }
+	DomainLookupAliceTenant2   = func(ctx context.Context, c *app.RequestContext) (string, string) { return "alice", "tenant2" }
+	DomainLookupBobTenant1     = func(ctx context.Context, c *app.RequestContext) (string, string) { return "bob", "tenant1" }
+	DomainLookupCharlieTenant2 = func(ctx context.Context, c *app.RequestContext) (string, string) { return "charlie", "tenant2" }
+	DomainLookupFrankGlobal    = func(ctx context.Context, c *app.RequestContext) (string, string) { return "frank", "global" }
+	DomainLookupNil            = func(ctx context.Context, c *app.RequestContext) (string, string) { return "", "" }
 )
 
 func TestNewAuthMiddleware(t *testing.T) {
@@ -696,6 +709,211 @@ func TestOption(t *testing.T) {
 
 			assert.DeepEqual(t, tt.args.expectedCode, rsp.Code)
 			assert.DeepEqual(t, tt.args.expectedTestHeader, rsp.Header().Get("test"))
+		})
+	}
+}
+
+func TestMultiTenantRequiresPermissions(t *testing.T) {
+	type args struct {
+		policyFile   string
+		domainLookup DomainLookupHandler
+		expression   string
+		expectedCode int
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			name: "alice can read book in tenant1",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant1,
+				expression:   "book:read",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "alice can write book in tenant1 (admin role)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant1,
+				expression:   "book:write",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "alice can only read article in tenant2 (reader role)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant2,
+				expression:   "article:read",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "alice cannot write article in tenant2 (reader role)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant2,
+				expression:   "article:write",
+				expectedCode: consts.StatusForbidden,
+			},
+		},
+		{
+			name: "bob can only read book in tenant1 (user role)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupBobTenant1,
+				expression:   "book:read",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "bob cannot write book in tenant1 (user role)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupBobTenant1,
+				expression:   "book:write",
+				expectedCode: consts.StatusForbidden,
+			},
+		},
+		{
+			name: "charlie can manage articles in tenant2 (admin role)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupCharlieTenant2,
+				expression:   "article:write",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "frank can manage global system (super_admin)",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupFrankGlobal,
+				expression:   "system:manage",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "unauthorized access",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupNil,
+				expression:   "book:read",
+				expectedCode: consts.StatusUnauthorized,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			middleware, err := NewCasbinMiddlewareFromEnforcerWithDomain(
+				func() casbin.IEnforcer {
+					e, _ := casbin.NewEnforcer(modelFileMultiTenant, tt.args.policyFile)
+					return e
+				}(),
+				tt.args.domainLookup,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := setupRouter(middleware.RequiresPermissions(tt.args.expression, WithEnableDomains(true)))
+
+			rsp := ut.PerformRequest(r.Engine, "GET", "/book", nil)
+
+			assert.DeepEqual(t, tt.args.expectedCode, rsp.Code)
+		})
+	}
+}
+
+func TestMultiTenantRequiresRoles(t *testing.T) {
+	type args struct {
+		policyFile   string
+		domainLookup DomainLookupHandler
+		expression   string
+		expectedCode int
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			name: "alice has admin role in tenant1",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant1,
+				expression:   "admin",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "alice has reader role in tenant2",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant2,
+				expression:   "reader",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "alice does not have admin role in tenant2",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupAliceTenant2,
+				expression:   "admin",
+				expectedCode: consts.StatusForbidden,
+			},
+		},
+		{
+			name: "bob has user role in tenant1",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupBobTenant1,
+				expression:   "user",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "charlie has admin role in tenant2",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupCharlieTenant2,
+				expression:   "admin",
+				expectedCode: consts.StatusOK,
+			},
+		},
+		{
+			name: "frank has super_admin role globally",
+			args: args{
+				policyFile:   multiTenantPolicy,
+				domainLookup: DomainLookupFrankGlobal,
+				expression:   "super_admin",
+				expectedCode: consts.StatusOK,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			middleware, err := NewCasbinMiddlewareFromEnforcerWithDomain(
+				func() casbin.IEnforcer {
+					e, _ := casbin.NewEnforcer(modelFileMultiTenant, tt.args.policyFile)
+					return e
+				}(),
+				tt.args.domainLookup,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := setupRouter(middleware.RequiresRoles(tt.args.expression, WithEnableDomains(true)))
+
+			rsp := ut.PerformRequest(r.Engine, "GET", "/book", nil)
+
+			assert.DeepEqual(t, tt.args.expectedCode, rsp.Code)
 		})
 	}
 }
